@@ -15,4 +15,4 @@ spec:
   ports:
     - name: metrics
       port: 15692
-      targetPort: 15962
+      targetPort: 15692
