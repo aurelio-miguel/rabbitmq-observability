@@ -1,14 +1,14 @@
-# RabbitMQ Observability Lab
+# RabbitMQ Observability
 
-A Kubernetes observability lab for investigating RabbitMQ queue demand, consumer behavior, and KEDA-driven autoscaling with Prometheus and Grafana.
+RabbitMQ observability on Kubernetes with Prometheus and Grafana, queue and consumer monitoring, operational alerts, and KEDA autoscaling analysis.
 
-> **Status: planning and initial documentation.** This README defines the intended scope and implementation sequence. Monitoring manifests, dashboards, alerts, and experiment results have not yet been validated. Repository paths below are a proposed structure, not existing deliverables.
+> **Status: monitoring stack deployed and RabbitMQ queue collection validated in the existing local cluster.** Prometheus returned queue-specific metrics for `tasks` during a message submission test. Grafana dashboards, custom alerts, and complete autoscaling experiments are still pending. See [experiment evidence](docs/experiments.md).
 
 ## Why this project?
 
 Autoscaling changes the number of workers, but replica count alone does not explain whether messages are being processed successfully or whether a backlog is growing faster than consumers can handle it.
 
-This lab aims to connect queue metrics, consumer activity, and Kubernetes workload state so that operational questions can be answered with evidence:
+This project aims to connect queue metrics, consumer activity, and Kubernetes workload state so that operational questions can be answered with evidence:
 
 - Is the queue accumulating work or draining?
 - Are consumers connected and acknowledging messages?
@@ -44,7 +44,7 @@ Enabling RabbitMQ metrics may require a change in the application repository, su
 
 Prometheus observes the existing application; it does not publish or consume business messages. Grafana visualizes collected data. KEDA continues to control worker scaling independently of the monitoring dashboards.
 
-The proposed monitoring namespace is `observability`. The existing application namespace is `keda-rabbitmq-autoscaling`. Cross-namespace discovery and access must be configured explicitly.
+The monitoring namespace is `monitoring`. The existing application namespace is `keda-rabbitmq-autoscaling`. Cross-namespace discovery and access must be configured explicitly.
 
 ## Initial scope
 
@@ -71,7 +71,7 @@ Logs, distributed traces, application-level latency instrumentation, and SLO-bas
 | Restarts and resource utilization | Are worker failures or resource constraints affecting consumption? | Kubernetes state and container metrics |
 | Scrape health | Is monitoring itself collecting data? | Prometheus target health |
 
-Exact metric names, labels, and queue-level exposure will be verified against the selected RabbitMQ version before dashboard queries are committed. Broker-wide aggregates are not substitutes for queue-specific measurements.
+The endpoint `/metrics/per-object` exposed `rabbitmq_queue_messages_ready`, `rabbitmq_queue_messages_unacked`, and `rabbitmq_queue_consumers` with `queue="tasks"` and `vhost="/"`. Prometheus collection of ready messages was confirmed during a message submission test. Publication, acknowledgement, and redelivery counters still need verification before dashboard queries are committed. Broker-wide aggregates are not substitutes for queue-specific measurements.
 
 A Kubernetes Ready pod does not necessarily mean a RabbitMQ consumer is connected. An empty ready queue does not prove completion while unacknowledged messages remain.
 
@@ -96,7 +96,7 @@ Each rule should include its purpose, severity, duration, relevant labels, and a
 - A working storage provisioner where persistence is requested.
 - Capacity for the application and monitoring stack; resource sizing remains to be measured.
 
-The existing lab was validated using context `kind-freekubelab`. Monitoring installation on that cluster has not yet been validated. An AWS account is not required for the initial scope.
+The application and monitoring stack were verified using context `kind-freekubelab`. RabbitMQ queue collection was confirmed through a Prometheus query during a message submission test. An AWS account is not required for the initial scope.
 
 ## Prepare the monitored application
 
@@ -118,7 +118,65 @@ kubectl --context kind-freekubelab get pods -n keda-rabbitmq-autoscaling
 kubectl --context kind-freekubelab get scaledobject,hpa -n keda-rabbitmq-autoscaling
 ```
 
-Return to this repository to configure monitoring. Installation commands will be added after the Helm chart version, values, and metrics integration have been implemented and tested. No monitoring setup script is available yet.
+Return to this repository to configure monitoring. Run the following commands from its root. The application must already expose metrics on port `15692`; plugin enablement belongs in the application repository and must survive pod recreation.
+
+## Install monitoring
+
+The selected chart version is `kube-prometheus-stack` **92.3.0**. The values configure one Prometheus replica, three-day retention, 30-second scrape and evaluation intervals, resource requests and memory limits, and ClusterIP access. Grafana persistence is disabled and no Prometheus persistent volume is configured; data can be lost when pods are recreated. Resource sizing is an initial configuration, not a measured capacity recommendation.
+
+Download the chart through the official OCI registry, then install the local archive:
+
+```bash
+helm pull oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack \
+  --version 92.3.0 --destination /tmp
+
+helm upgrade --install monitoring /tmp/kube-prometheus-stack-92.3.0.tgz \
+  --kube-context kind-freekubelab \
+  --namespace monitoring --create-namespace \
+  --values helm/monitoring-values.yaml \
+  --wait --timeout 10m
+
+kubectl --context kind-freekubelab apply -f monitoring/services/rabbitmq-metrics.yaml
+kubectl --context kind-freekubelab apply -f monitoring/service-monitors/rabbitmq.yaml
+kubectl --context kind-freekubelab -n monitoring get pods
+```
+
+The traditional Helm repository is also supported, using `prometheus-community/kube-prometheus-stack` and `--version 92.3.0`. Downloads from GitHub release assets timed out during setup; OCI offers another distribution path. The exact installation route used for the successful deployment was not recorded. The Helm wait timeout does not resolve download or DNS failures.
+
+The metrics Service lives in `keda-rabbitmq-autoscaling` and selects pods with `app: rabbitmq`. Its named port `metrics` maps `15692` to `15692`. The ServiceMonitor lives in `monitoring`, has label `release: monitoring`, and selects Services with `app: rabbitmq` and `component: metrics` in the application namespace. It scrapes `/metrics/per-object` every 30 seconds with a 10-second scrape timeout.
+
+## Verify collection
+
+Access RabbitMQ metrics locally in one terminal:
+
+```bash
+kubectl --context kind-freekubelab -n keda-rabbitmq-autoscaling \
+  port-forward service/rabbitmq-metrics 15692:15692
+```
+
+In another terminal:
+
+```bash
+curl -fsS http://localhost:15692/metrics/per-object |
+  rg '^rabbitmq_queue_(messages_ready|messages_unacked|consumers)\{'
+```
+
+To access Prometheus, start another port-forward:
+
+```bash
+kubectl --context kind-freekubelab -n monitoring \
+  port-forward service/monitoring-kube-prometheus-prometheus 9090:9090
+```
+
+Open `http://localhost:9090/targets`, check the RabbitMQ target, and run:
+
+```promql
+rabbitmq_queue_messages_ready{queue="tasks",vhost="/"}
+```
+
+A returned zero is a collected measurement; an empty result is missing telemetry. Port-forward is only for local inspection: Prometheus collects through the internal Service. If forwarding reports `15692 -> 15962`, correct the Service target port to `15692` and reapply it.
+
+Setup and scoped cleanup scripts have not been implemented yet.
 
 ## Validation plan
 
@@ -132,7 +190,9 @@ Return to this repository to configure monitoring. Installation commands will be
 
 Record both ready and unacknowledged message counts at completion. Keep workloads separate and verify the queue is empty before comparable runs. Avoid rebuilding or changing worker configuration during a measurement.
 
-## Proposed repository structure
+## Repository structure
+
+Implemented files:
 
 ```text
 rabbitmq-observability-lab/
@@ -140,33 +200,24 @@ rabbitmq-observability-lab/
 │   └── monitoring-values.yaml
 ├── monitoring/
 │   ├── services/
-│   ├── service-monitors/
-│   ├── recording-rules/
-│   └── alert-rules/
-├── grafana/
-│   └── dashboards/
-├── scripts/
-│   ├── setup.sh
-│   └── cleanup.sh
-├── tests/
+│   │   └── rabbitmq-metrics.yaml
+│   └── service-monitors/
+│       └── rabbitmq.yaml
 ├── docs/
-│   ├── architecture.md
-│   ├── operations.md
-│   ├── experiments.md
-│   ├── results.md
-│   └── runbooks/
+│   └── experiments.md
 └── README.md
 ```
 
-Directories and scripts will be added as their implementation is completed. Application source code and deployment manifests remain in the upstream KEDA lab.
+Recording rules, custom alerts, Grafana dashboards, runbooks, setup/cleanup scripts, and CI checks will be added as they are implemented. Application source code and deployment manifests remain in the upstream KEDA project.
 
 ## Implementation roadmap
 
 - [ ] Record the application commit and validate its required metrics configuration.
-- [ ] Select and pin a monitoring Helm chart version.
-- [ ] Define lab resource requests, limits, and retention settings.
-- [ ] Deploy the monitoring stack and validate target discovery.
-- [ ] Implement RabbitMQ and Kubernetes scrape integration.
+- [x] Select and pin a monitoring Helm chart version: `92.3.0`.
+- [x] Define initial resource requests, memory limits, and retention settings (capacity measurement pending).
+- [x] Deploy the monitoring stack and confirm RabbitMQ discovery through a collected queue series.
+- [x] Implement RabbitMQ scrape integration.
+- [ ] Validate Kubernetes worker-state and resource metric queries.
 - [ ] Version the initial Grafana dashboard.
 - [ ] Implement alert rules and runbooks.
 - [ ] Validate healthy, slow-consumer, no-consumer, and replica-ceiling scenarios.
@@ -184,8 +235,8 @@ Keep credentials out of Git, dashboards, shared logs, and screenshots. Access to
 
 ## Limitations and future work
 
-This is a local lab, not a production monitoring platform. High availability, remote metric storage, production retention sizing, external alert delivery, and multi-cluster operation are outside the initial scope.
+The current deployment targets a local Kubernetes environment. Production readiness has not been assessed. High availability, remote metric storage, production retention sizing, external alert delivery, and multi-cluster operation are outside the initial scope.
 
 A processing-time SLO requires application instrumentation and a clear definition of successful processing and its denominator. Queue depth alone cannot establish latency compliance. Later iterations can add message latency metrics, logs, traces, and SLO/error-budget analysis after these signals are implemented and validated.
 
-No observability results are claimed yet. Completed experiments will document both successful behavior and limitations.
+Initial RabbitMQ collection evidence is recorded in [docs/experiments.md](docs/experiments.md). Complete scaling behavior, alert firing and resolution, performance, and fresh-environment reproducibility have not yet been validated.
